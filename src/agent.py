@@ -1,6 +1,7 @@
 """Агентный цикл управления компьютером: восприятие → решение → действие."""
 from __future__ import annotations
 
+import json
 import logging
 import os
 import subprocess
@@ -18,6 +19,45 @@ from prompts import system_prompt
 from screen import ScreenCapturer
 
 logger = logging.getLogger("autonomica.agent")
+
+
+def _coerce_xy(action: dict[str, Any]) -> tuple[float, float] | None:
+    """Извлекает координаты x,y из действия, терпимо к форматам модели.
+
+    Поддерживаются варианты:
+      {"x": 10, "y": 20}
+      {"x": [10, 20]}            # модель сложила обе координаты в x
+      {"coordinate": [10, 20]}   # или отдельным ключом
+      {"position": [10, 20]} / {"point": [10, 20]} / {"xy": [10, 20]}
+    Возвращает (x, y) или None, если распарсить не удалось.
+    """
+    def _to_pair(val: Any) -> tuple[float, float] | None:
+        if isinstance(val, (list, tuple)) and len(val) >= 2:
+            try:
+                return float(val[0]), float(val[1])
+            except (TypeError, ValueError):
+                return None
+        return None
+
+    # x как массив [x, y]
+    pair = _to_pair(action.get("x"))
+    if pair is not None:
+        return pair
+
+    # отдельные ключи-массивы
+    for key in ("coordinate", "coordinates", "position", "point", "xy", "loc"):
+        pair = _to_pair(action.get(key))
+        if pair is not None:
+            return pair
+
+    # классический случай: x и y по отдельности
+    x, y = action.get("x"), action.get("y")
+    if x is not None and y is not None:
+        try:
+            return float(x), float(y)
+        except (TypeError, ValueError):
+            return None
+    return None
 
 
 class TaskStatus(str, Enum):
@@ -123,8 +163,10 @@ class Agent:
             return (f"Нажато: {combo}", False)
 
         if atype in ("click", "double_click", "move"):
-            mx = float(action.get("x", 0))
-            my = float(action.get("y", 0))
+            xy = _coerce_xy(action)
+            if xy is None:
+                return (f"Действие {atype} без корректных координат: {action}", False)
+            mx, my = xy
             rx, ry = capture.to_real(mx, my)
             if atype == "move":
                 self.controller.move(rx, ry)
@@ -139,11 +181,10 @@ class Agent:
 
         if atype == "scroll":
             amount = int(action.get("amount", 0))
-            x = action.get("x")
-            y = action.get("y")
             rx = ry = None
-            if x is not None and y is not None:
-                rx, ry = capture.to_real(float(x), float(y))
+            xy = _coerce_xy(action)
+            if xy is not None:
+                rx, ry = capture.to_real(xy[0], xy[1])
             self.controller.scroll(amount, rx, ry)
             return (f"Скролл {amount}", False)
 
@@ -156,8 +197,7 @@ class Agent:
         vision = self.settings.vision_enabled
         os.makedirs(self.settings.log_dir, exist_ok=True)
         shots_dir = os.path.join(self.settings.log_dir, "shots", task.id)
-        if self.settings.save_step_screenshots:
-            os.makedirs(shots_dir, exist_ok=True)
+        os.makedirs(shots_dir, exist_ok=True)
 
         # начальный системный промпт строим по размеру первого скриншота
         first = self.capturer.capture()
@@ -165,6 +205,9 @@ class Agent:
             {"role": "system", "content": system_prompt(vision, first.model_width, first.model_height)},
             {"role": "user", "content": f"ЗАДАЧА ПОЛЬЗОВАТЕЛЯ: {task.command}"},
         ]
+
+        last_sig: str | None = None
+        repeat_count = 0
 
         try:
             for step_idx in range(1, self.settings.max_steps + 1):
@@ -232,6 +275,26 @@ class Agent:
                 # сообщаем модели итог действия следующим ходом
                 messages.append({"role": "user", "content": f"Результат предыдущего действия: {result}"})
 
+                # защита от зацикливания: если одно и то же действие повторяется
+                # подряд и не даёт эффекта — подсказываем сменить подход
+                sig = json.dumps(action, sort_keys=True, ensure_ascii=False)
+                if sig == last_sig:
+                    repeat_count += 1
+                else:
+                    repeat_count = 0
+                    last_sig = sig
+                if repeat_count >= 2:
+                    messages.append({
+                        "role": "user",
+                        "content": (
+                            "Ты повторяешь одно и то же действие без видимого эффекта. "
+                            "Смени подход: попробуй другие координаты, прокрутку (scroll), "
+                            "горячие клавиши, переход по прямому URL (open_url) или закрытие "
+                            "мешающего окна клавишей Escape. Не повторяй прошлый клик."
+                        ),
+                    })
+                    repeat_count = 0
+
                 time.sleep(self.settings.step_delay)
             else:
                 # цикл завершился без done/fail
@@ -243,6 +306,13 @@ class Agent:
             task.status = TaskStatus.ERROR
             task.error = str(exc)
         finally:
+            # финальный скриншот состояния системы (для чат-UI), независимо от
+            # настройки save_step_screenshots
+            try:
+                final = self.capturer.capture()
+                final.save(os.path.join(shots_dir, "final.png"))
+            except Exception:  # noqa: BLE001
+                logger.warning("Не удалось сохранить финальный скриншот", exc_info=True)
             task.finished_at = datetime.now(timezone.utc).isoformat()
 
     @staticmethod
