@@ -1,0 +1,31 @@
+# systemd USER-сервис (важно: именно user, т.к. нужен доступ к графической сессии).
+#
+# Установка:
+#   mkdir -p ~/.config/systemd/user
+#   cp deploy/autonomica.service ~/.config/systemd/user/
+#   # отредактируйте WorkingDirectory и путь к venv ниже
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now autonomica.service
+#
+# Чтобы сервис стартовал без активного логина (для headless-автозапуска):
+#   sudo loginctl enable-linger $USER
+#
+# Логи:  journalctl --user -u autonomica -f
+
+[Unit]
+Description=Autonomica - LLM computer-use agent
+After=graphical-session.target
+PartOf=graphical-session.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/autonomica
+# X11: укажите дисплей вашей сессии (обычно :0)
+Environment=DISPLAY=:0
+Environment=XAUTHORITY=%h/.Xauthority
+ExecStart=%h/autonomica/.venv/bin/python src/server.py
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=graphical-session.target

@@ -1,0 +1,10 @@
+fastapi>=0.110
+uvicorn[standard]>=0.29
+openai>=1.30
+pydantic>=2.6
+pydantic-settings>=2.2
+python-dotenv>=1.0
+Pillow>=10.0
+mss>=9.0
+pyautogui>=0.9.54
+python-xlib>=0.33 ; sys_platform == "linux"
