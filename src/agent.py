@@ -1,6 +1,7 @@
 """Агентный цикл управления компьютером: восприятие → решение → действие."""
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
@@ -19,6 +20,17 @@ from prompts import system_prompt
 from screen import ScreenCapturer
 
 logger = logging.getLogger("autonomica.agent")
+
+# Антизацикливание: на каком числе ОДИНАКОВЫХ подряд действий вмешиваться и
+# на каком — аварийно прекращать задачу.
+LOOP_WARN = 2    # 3-е одинаковое действие подряд -> Escape + жёсткая подсказка
+LOOP_ABORT = 4   # 5-е одинаковое действие подряд -> провал задачи
+
+
+def _screen_sig(capture) -> str:
+    """Дешёвая сигнатура экрана для детекта 'экран не изменился'."""
+    thumb = capture.image.convert("L").resize((32, 32))
+    return hashlib.md5(thumb.tobytes()).hexdigest()
 
 
 def _coerce_xy(action: dict[str, Any]) -> tuple[float, float] | None:
@@ -207,7 +219,9 @@ class Agent:
         ]
 
         last_sig: str | None = None
-        repeat_count = 0
+        identical_streak = 0
+        prev_screen_sig: str | None = None
+        prev_executed: dict[str, Any] | None = None
 
         try:
             for step_idx in range(1, self.settings.max_steps + 1):
@@ -218,16 +232,27 @@ class Agent:
 
                 capture = self.capturer.capture() if step_idx > 1 else first
 
+                # экран изменился после предыдущего действия?
+                screen_sig = _screen_sig(capture)
+                screen_changed = prev_screen_sig is None or screen_sig != prev_screen_sig
+                prev_screen_sig = screen_sig
+
                 shot_path: str | None = None
                 if self.settings.save_step_screenshots:
                     shot_path = os.path.join(shots_dir, f"step_{step_idx:03d}.png")
                     capture.save(shot_path)
 
                 # текст состояния + (опционально) картинка
+                no_change = ""
+                if prev_executed is not None and not screen_changed:
+                    no_change = (
+                        " ВНИМАНИЕ: экран НЕ изменился после предыдущего действия — "
+                        "оно НЕ сработало. Выбери ДРУГОЕ действие, не повторяй прошлое."
+                    )
                 state_text = (
                     f"Шаг {step_idx}/{self.settings.max_steps}. "
                     f"Размер изображения: {capture.model_width}x{capture.model_height}. "
-                    "Выбери следующее действие (строго JSON)."
+                    f"Выбери следующее действие (строго JSON).{no_change}"
                 )
                 image_url = capture.to_data_url() if vision else None
                 self._prune_old_images(messages)
@@ -265,6 +290,50 @@ class Agent:
                     task.result = str(action.get("reason", "Модель сообщила о невозможности"))
                     break
 
+                # --- антизацикливание ---
+                sig = json.dumps(action, sort_keys=True, ensure_ascii=False)
+                if sig == last_sig:
+                    identical_streak += 1
+                else:
+                    identical_streak = 0
+                    last_sig = sig
+
+                if identical_streak >= LOOP_ABORT:
+                    msg = (
+                        f"Агент застрял: одно и то же действие ({atype}) повторено "
+                        f"{identical_streak + 1} раз подряд без эффекта. Прерываю."
+                    )
+                    logger.warning(msg)
+                    task.steps.append(Step(step_idx, thought, action, "застрял в цикле — прервано", shot_path))
+                    task.status = TaskStatus.FAILED
+                    task.result = msg
+                    break
+
+                if identical_streak >= LOOP_WARN:
+                    # принудительно разрываем залипание: Escape закрывает overview,
+                    # модальные окна и т.п. Сам повтор НЕ выполняем.
+                    try:
+                        self.controller.press_keys("escape")
+                        broke = "нажат Escape"
+                    except Exception:  # noqa: BLE001
+                        broke = "Escape не удался"
+                    task.steps.append(
+                        Step(step_idx, thought, action, f"повтор пропущен ({broke})", shot_path)
+                    )
+                    messages.append({
+                        "role": "user",
+                        "content": (
+                            "Ты повторяешь ОДНО И ТО ЖЕ действие, оно не работает. "
+                            "Я нажал Escape, чтобы закрыть возможное мешающее окно/режим обзора. "
+                            "ЗАПРЕЩЕНО повторять предыдущий клик. Используй другой способ: "
+                            "launch (например launch firefox), open_url, горячие клавиши или "
+                            "другие координаты."
+                        ),
+                    })
+                    prev_executed = {"type": "key", "keys": "escape"}
+                    time.sleep(self.settings.step_delay)
+                    continue
+
                 try:
                     result, _ = self._execute(action, capture)
                 except Exception as exc:  # noqa: BLE001 - хотим сообщить модели об ошибке
@@ -272,28 +341,8 @@ class Agent:
                     logger.exception("Ошибка действия на шаге %s", step_idx)
 
                 task.steps.append(Step(step_idx, thought, action, result, shot_path))
-                # сообщаем модели итог действия следующим ходом
                 messages.append({"role": "user", "content": f"Результат предыдущего действия: {result}"})
-
-                # защита от зацикливания: если одно и то же действие повторяется
-                # подряд и не даёт эффекта — подсказываем сменить подход
-                sig = json.dumps(action, sort_keys=True, ensure_ascii=False)
-                if sig == last_sig:
-                    repeat_count += 1
-                else:
-                    repeat_count = 0
-                    last_sig = sig
-                if repeat_count >= 2:
-                    messages.append({
-                        "role": "user",
-                        "content": (
-                            "Ты повторяешь одно и то же действие без видимого эффекта. "
-                            "Смени подход: попробуй другие координаты, прокрутку (scroll), "
-                            "горячие клавиши, переход по прямому URL (open_url) или закрытие "
-                            "мешающего окна клавишей Escape. Не повторяй прошлый клик."
-                        ),
-                    })
-                    repeat_count = 0
+                prev_executed = action
 
                 time.sleep(self.settings.step_delay)
             else:
